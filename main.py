@@ -5,6 +5,7 @@ Inspired by ZDT - Zhongwen Development Tool
 
 Features:
 - HSK vocabulary flashcards (levels 1-6)
+- CEDICT dictionary integration (download and search)
 - Spaced repetition system (SM-2 algorithm)
 - Study mode with self-assessment
 - Quiz mode with multiple choice questions
@@ -17,17 +18,22 @@ Features:
 import sys
 import json
 import random
+import gzip
+import shutil
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
+import urllib.request
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QStackedWidget, QProgressBar, QMessageBox,
     QFileDialog, QInputDialog, QLineEdit, QDialog, QDialogButtonBox,
-    QScrollArea, QFrame, QComboBox, QGroupBox, QTextEdit, QFormLayout
+    QScrollArea, QFrame, QComboBox, QGroupBox, QTextEdit, QFormLayout,
+    QListWidget, QListWidgetItem, QSplitter
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QAction
 
 # HSK Vocabulary Data
@@ -138,6 +144,219 @@ class FlashcardData:
         """Create a custom deck."""
         self.custom_decks[name] = cards
         self.save_data()
+
+
+class CedictEntry:
+    """Represents a single entry from the CEDICT dictionary."""
+    
+    def __init__(self, traditional: str, simplified: str, pinyin: str, meanings: List[str]):
+        self.traditional = traditional
+        self.simplified = simplified
+        self.pinyin = pinyin
+        self.meanings = meanings
+    
+    @property
+    def display_char(self) -> str:
+        """Return simplified character if different, otherwise traditional."""
+        return self.simplified if self.simplified != self.traditional else self.traditional
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary format for flashcards."""
+        return {
+            "character": self.display_char,
+            "pinyin": self.pinyin,
+            "meaning": "; ".join(self.meanings[:3])  # Show first 3 meanings
+        }
+
+
+class CedictManager:
+    """Manages downloading, parsing, and searching the CEDICT dictionary."""
+    
+    CEDICT_URL = "https://www.mdbg.net/chindict/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt"
+    CEDICT_GZ_URL = "https://cc-cedict.org/download/cedict_ts.u8.gz"
+    
+    def __init__(self):
+        self.data_dir = Path.home() / ".mandarin_flashcards" / "cedict"
+        self.data_file = self.data_dir / "cedict_ts.u8"
+        self.entries: List[CedictEntry] = []
+        self.is_loaded = False
+        self.is_downloading = False
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+    
+    def download_cedict(self, progress_callback=None) -> bool:
+        """Download the CEDICT database from cc-cedict.org."""
+        try:
+            self.is_downloading = True
+            if progress_callback:
+                progress_callback("Downloading CEDICT dictionary...")
+            
+            # Try the gzipped version first (smaller download)
+            urls_to_try = [self.CEDICT_GZ_URL, self.CEDICT_URL]
+            
+            for url in urls_to_try:
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, timeout=30) as response:
+                        data = response.read()
+                    
+                    if url.endswith('.gz'):
+                        # Decompress gzip file
+                        if progress_callback:
+                            progress_callback("Decompressing...")
+                        with open(self.data_file, 'wb') as f:
+                            f.write(gzip.decompress(data))
+                    else:
+                        with open(self.data_file, 'wb') as f:
+                            f.write(data)
+                    
+                    if progress_callback:
+                        progress_callback("Download complete!")
+                    
+                    self.is_downloading = False
+                    return True
+                    
+                except Exception as e:
+                    print(f"Failed to download from {url}: {e}")
+                    continue
+            
+            self.is_downloading = False
+            return False
+            
+        except Exception as e:
+            self.is_downloading = False
+            if progress_callback:
+                progress_callback(f"Error: {str(e)}")
+            return False
+    
+    def parse_cedict(self, progress_callback=None) -> int:
+        """Parse the CEDICT file and load entries into memory."""
+        if not self.data_file.exists():
+            return 0
+        
+        self.entries = []
+        count = 0
+        
+        try:
+            with open(self.data_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            total_lines = len(lines)
+            
+            for i, line in enumerate(lines):
+                line = line.strip()
+                
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Parse CEDICT format: Traditional Simplified [pinyin] /meanings/
+                match = re.match(r'^(\S+)\s+(\S+)\s+\[([^\]]+)\]\s+/(.+)$', line)
+                if match:
+                    traditional = match.group(1)
+                    simplified = match.group(2)
+                    pinyin = match.group(3)
+                    meanings_str = match.group(4)
+                    
+                    # Split meanings by /
+                    meanings = [m.strip() for m in meanings_str.split('/') if m.strip()]
+                    
+                    if meanings:
+                        entry = CedictEntry(traditional, simplified, pinyin, meanings)
+                        self.entries.append(entry)
+                        count += 1
+                
+                # Progress callback every 10000 lines
+                if progress_callback and i % 10000 == 0:
+                    progress_callback(f"Parsing: {i}/{total_lines} lines...")
+            
+            self.is_loaded = True
+            return count
+            
+        except Exception as e:
+            print(f"Error parsing CEDICT: {e}")
+            return 0
+    
+    def search(self, query: str, limit: int = 100) -> List[CedictEntry]:
+        """Search the dictionary by character, pinyin, or meaning."""
+        if not self.is_loaded or not self.entries:
+            return []
+        
+        query = query.lower().strip()
+        if not query:
+            return []
+        
+        results = []
+        for entry in self.entries:
+            if len(results) >= limit:
+                break
+            
+            # Search in traditional/simplified characters
+            if query in entry.traditional or query in entry.simplified:
+                results.append(entry)
+                continue
+            
+            # Search in pinyin
+            if query in entry.pinyin.lower():
+                results.append(entry)
+                continue
+            
+            # Search in meanings
+            for meaning in entry.meanings:
+                if query in meaning.lower():
+                    results.append(entry)
+                    break
+        
+        return results
+    
+    def get_entry_for_character(self, char: str) -> Optional[CedictEntry]:
+        """Get the first matching entry for a character."""
+        if not self.is_loaded:
+            return None
+        
+        for entry in self.entries:
+            if char in entry.traditional or char in entry.simplified:
+                return entry
+        return None
+    
+    def is_database_available(self) -> bool:
+        """Check if the CEDICT database file exists."""
+        return self.data_file.exists()
+    
+    def get_stats(self) -> Dict:
+        """Get dictionary statistics."""
+        return {
+            "entries_loaded": len(self.entries),
+            "is_loaded": self.is_loaded,
+            "file_exists": self.data_file.exists()
+        }
+
+
+class DownloadThread(QThread):
+    """Background thread for downloading CEDICT."""
+    progress_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool)
+    
+    def __init__(self, cedict_manager: CedictManager):
+        super().__init__()
+        self.cedict_manager = cedict_manager
+    
+    def run(self):
+        success = self.cedict_manager.download_cedict(lambda msg: self.progress_signal.emit(msg))
+        self.finished_signal.emit(success)
+
+
+class ParseThread(QThread):
+    """Background thread for parsing CEDICT."""
+    progress_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(int)
+    
+    def __init__(self, cedict_manager: CedictManager):
+        super().__init__()
+        self.cedict_manager = cedict_manager
+    
+    def run(self):
+        count = self.cedict_manager.parse_cedict(lambda msg: self.progress_signal.emit(msg))
+        self.finished_signal.emit(count)
 
 
 class FlashcardWidget(QWidget):
@@ -408,12 +627,171 @@ class CreateDeckDialog(QDialog):
         return name, cards
 
 
+class DictionarySearchDialog(QDialog):
+    """Dialog for searching the CEDICT dictionary."""
+    
+    def __init__(self, cedict_manager: CedictManager, parent=None):
+        super().__init__(parent)
+        self.cedict_manager = cedict_manager
+        self.setWindowTitle("Dictionary Search")
+        self.setMinimumSize(700, 500)
+        self._init_ui()
+    
+    def _init_ui(self):
+        layout = QVBoxLayout()
+        
+        # Search input
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("Search:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Enter Chinese character, pinyin, or English meaning...")
+        self.search_input.returnPressed.connect(self._search)
+        search_layout.addWidget(self.search_input)
+        
+        search_btn = QPushButton("Search")
+        search_btn.clicked.connect(self._search)
+        search_layout.addWidget(search_btn)
+        
+        layout.addLayout(search_layout)
+        
+        # Results info
+        self.results_label = QLabel("Enter a search term and press Enter")
+        layout.addWidget(self.results_label)
+        
+        # Results list
+        self.results_list = QListWidget()
+        self.results_list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        layout.addWidget(self.results_list)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        
+        add_to_deck_btn = QPushButton("Add Selected to Custom Deck")
+        add_to_deck_btn.clicked.connect(self._add_selected_to_deck)
+        btn_layout.addWidget(add_to_deck_btn)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        self.setLayout(layout)
+        self.current_results = []
+    
+    def _search(self):
+        """Perform dictionary search."""
+        query = self.search_input.text().strip()
+        if not query:
+            self.results_label.setText("Please enter a search term")
+            return
+        
+        if not self.cedict_manager.is_loaded:
+            if not self.cedict_manager.is_database_available():
+                self.results_label.setText("Database not found. Please download it first.")
+                return
+            else:
+                self.results_label.setText("Loading database...")
+                self.cedict_manager.parse_cedict()
+        
+        self.results_label.setText("Searching...")
+        QApplication.processEvents()
+        
+        self.current_results = self.cedict_manager.search(query, limit=200)
+        
+        self.results_list.clear()
+        if not self.current_results:
+            self.results_label.setText(f"No results found for '{query}'")
+            return
+        
+        self.results_label.setText(f"Found {len(self.current_results)} results for '{query}'")
+        
+        for entry in self.current_results:
+            display_text = f"{entry.display_char} [{entry.pinyin}] - {'; '.join(entry.meanings[:2])}"
+            item = QListWidgetItem(display_text)
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            self.results_list.addItem(item)
+    
+    def _on_item_double_clicked(self, item: QListWidgetItem):
+        """Handle double-click on result item."""
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if entry:
+            # Show detailed view
+            detail_dialog = QDialog(self)
+            detail_dialog.setWindowTitle("Entry Details")
+            detail_dialog.setMinimumWidth(500)
+            
+            layout = QVBoxLayout()
+            
+            char_label = QLabel(entry.display_char)
+            char_label.setFont(QFont("Arial", 48, QFont.Weight.Bold))
+            char_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(char_label)
+            
+            if entry.traditional != entry.simplified:
+                trad_label = QLabel(f"Traditional: {entry.traditional}")
+                trad_label.setFont(QFont("Arial", 18))
+                trad_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(trad_label)
+            
+            pinyin_label = QLabel(f"Pinyin: {entry.pinyin}")
+            pinyin_label.setFont(QFont("Arial", 16))
+            pinyin_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(pinyin_label)
+            
+            meanings_text = "\n".join([f"• {m}" for m in entry.meanings])
+            meanings_label = QLabel(f"Meanings:\n{meanings_text}")
+            meanings_label.setFont(QFont("Arial", 12))
+            meanings_label.setWordWrap(True)
+            layout.addWidget(meanings_label)
+            
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(detail_dialog.accept)
+            layout.addWidget(close_btn)
+            
+            detail_dialog.setLayout(layout)
+            detail_dialog.exec()
+    
+    def _add_selected_to_deck(self):
+        """Add selected entries to a custom deck."""
+        selected_items = self.results_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select one or more entries to add.")
+            return
+        
+        cards = []
+        for item in selected_items:
+            entry = item.data(Qt.ItemDataRole.UserRole)
+            if entry:
+                cards.append(entry.to_dict())
+        
+        if cards:
+            name, ok = QInputDialog.getText(self, "Add to Deck", 
+                "Enter deck name (or select existing):")
+            if ok and name:
+                # Get existing cards if deck exists
+                existing = self.cedict_manager.parent.flashcard_data.get_cards_for_level(name) if hasattr(self.cedict_manager, 'parent') else []
+                all_cards = existing + cards
+                
+                if hasattr(self.cedict_manager, 'parent'):
+                    self.cedict_manager.parent.flashcard_data.create_custom_deck(name, all_cards)
+                    if name not in [self.cedict_manager.parent.level_combo.itemText(i) 
+                                   for i in range(self.cedict_manager.parent.level_combo.count())]:
+                        self.cedict_manager.parent.level_combo.addItem(name)
+                
+                QMessageBox.information(
+                    self, "Added to Deck",
+                    f"Added {len(cards)} entries to '{name}' deck."
+                )
+
+
 class MandarinFlashcardApp(QMainWindow):
     """Main application window."""
     
     def __init__(self):
         super().__init__()
         self.flashcard_data = FlashcardData()
+        self.cedict_manager = CedictManager()
         self.current_mode = "study"
         self.current_cards = []
         self.current_index = 0
@@ -421,6 +799,7 @@ class MandarinFlashcardApp(QMainWindow):
         self.session_total = 0
         self._init_ui()
         self.load_deck("HSK 1")
+        self._check_cedict_status()
     
     def _init_ui(self):
         self.setWindowTitle("Mandarin Flashcards - Learn Chinese")
@@ -514,6 +893,21 @@ class MandarinFlashcardApp(QMainWindow):
         create_action = QAction("&Create Custom Deck", self)
         create_action.triggered.connect(self._create_custom_deck)
         decks_menu.addAction(create_action)
+        
+        # Dictionary menu
+        dict_menu = menubar.addMenu("&Dictionary")
+        
+        download_action = QAction("&Download CEDICT Database", self)
+        download_action.triggered.connect(self._download_cedict)
+        dict_menu.addAction(download_action)
+        
+        search_action = QAction("&Search Dictionary", self)
+        search_action.triggered.connect(self._show_dictionary_search)
+        dict_menu.addAction(search_action)
+        
+        status_action = QAction("Database &Status", self)
+        status_action.triggered.connect(self._show_cedict_status)
+        dict_menu.addAction(status_action)
         
         help_menu = menubar.addMenu("&Help")
         about_action = QAction("&About", self)
@@ -743,6 +1137,7 @@ class MandarinFlashcardApp(QMainWindow):
             <p><b>Features:</b></p>
             <ul>
                 <li>HSK vocabulary (levels 1-6)</li>
+                <li>CEDICT dictionary integration (100,000+ entries)</li>
                 <li>Spaced repetition system (SM-2)</li>
                 <li>Study and Quiz modes</li>
                 <li>Custom deck creation</li>
@@ -750,6 +1145,118 @@ class MandarinFlashcardApp(QMainWindow):
             </ul>
             <p>Inspired by ZDT - Zhongwen Development Tool</p>"""
         )
+    
+    def _check_cedict_status(self):
+        """Check CEDICT database status on startup."""
+        if not self.cedict_manager.is_database_available():
+            self.statusBar().showMessage("CEDICT database not found. Use Dictionary menu to download.", 5000)
+    
+    def _download_cedict(self):
+        """Download CEDICT database."""
+        if self.cedict_manager.is_downloading:
+            QMessageBox.information(self, "Download", "Download already in progress...")
+            return
+        
+        reply = QMessageBox.question(
+            self, "Download CEDICT",
+            "This will download the CEDICT Chinese-English dictionary (~3MB compressed).\n"
+            "The database will be stored in ~/.mandarin_flashcards/cedict/\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self._status_label = QLabel("Downloading CEDICT...")
+            self.statusBar().addPermanentWidget(self._status_label)
+            
+            self.download_thread = DownloadThread(self.cedict_manager)
+            self.download_thread.progress_signal.connect(self._on_download_progress)
+            self.download_thread.finished_signal.connect(self._on_download_finished)
+            self.download_thread.start()
+    
+    def _on_download_progress(self, msg: str):
+        """Handle download progress updates."""
+        if hasattr(self, '_status_label'):
+            self._status_label.setText(msg)
+    
+    def _on_download_finished(self, success: bool):
+        """Handle download completion."""
+        if hasattr(self, '_status_label'):
+            self._status_label.deleteLater()
+            delattr(self, '_status_label')
+        
+        if success:
+            QMessageBox.information(
+                self, "Download Complete",
+                "CEDICT database downloaded successfully!\n\n"
+                "Now parsing the dictionary file...\n"
+                "(This may take a few moments)"
+            )
+            # Start parsing
+            self._parse_cedict()
+        else:
+            QMessageBox.critical(
+                self, "Download Failed",
+                "Failed to download CEDICT database.\nPlease check your internet connection."
+            )
+    
+    def _parse_cedict(self):
+        """Parse the CEDICT database file."""
+        self._status_label = QLabel("Parsing CEDICT...")
+        self.statusBar().addPermanentWidget(self._status_label)
+        
+        self.parse_thread = ParseThread(self.cedict_manager)
+        self.parse_thread.progress_signal.connect(self._on_parse_progress)
+        self.parse_thread.finished_signal.connect(self._on_parse_finished)
+        self.parse_thread.start()
+    
+    def _on_parse_progress(self, msg: str):
+        """Handle parse progress updates."""
+        if hasattr(self, '_status_label'):
+            self._status_label.setText(msg)
+    
+    def _on_parse_finished(self, count: int):
+        """Handle parse completion."""
+        if hasattr(self, '_status_label'):
+            self._status_label.deleteLater()
+            delattr(self, '_status_label')
+        
+        if count > 0:
+            QMessageBox.information(
+                self, "Dictionary Ready",
+                f"Successfully loaded {count:,} dictionary entries!\n\n"
+                "You can now search the dictionary using the Dictionary menu."
+            )
+            self.statusBar().showMessage(f"CEDICT loaded: {count:,} entries", 5000)
+        else:
+            QMessageBox.warning(
+                self, "Parse Error",
+                "Failed to parse CEDICT database file."
+            )
+    
+    def _show_cedict_status(self):
+        """Show CEDICT database status."""
+        stats = self.cedict_manager.get_stats()
+        status_msg = "CEDICT Database Status\n\n"
+        
+        if stats["file_exists"]:
+            status_msg += "✓ Database file exists\n"
+        else:
+            status_msg += "✗ Database file not found\n"
+        
+        if stats["is_loaded"]:
+            status_msg += f"✓ Loaded: {stats['entries_loaded']:,} entries\n"
+        else:
+            status_msg += "✗ Not loaded into memory\n"
+        
+        status_msg += f"\nLocation: {self.cedict_manager.data_file}"
+        
+        QMessageBox.information(self, "CEDICT Status", status_msg)
+    
+    def _show_dictionary_search(self):
+        """Show dictionary search dialog."""
+        dialog = DictionarySearchDialog(self.cedict_manager, self)
+        dialog.exec()
     
     def closeEvent(self, event):
         """Save data on close."""
