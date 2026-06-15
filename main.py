@@ -35,9 +35,16 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QAction
+from PyQt6.QtSvg import QSvgWidget
 
-# HSK Vocabulary Data
-HSK_VOCABULARY = {
+from stroke_animation import StrokeAnimationWidget
+from hsk_data.hsk_vocabulary import HSK_VOCABULARY
+
+# HSK Vocabulary Data (fallback if external module not available)
+try:
+    from hsk_data.hsk_vocabulary import HSK_VOCABULARY
+except ImportError:
+    HSK_VOCABULARY = {
     "HSK 1": [
         {"character": "你好", "pinyin": "nǐ hǎo", "meaning": "Hello"},
         {"character": "谢谢", "pinyin": "xiè xie", "meaning": "Thank you"},
@@ -45,9 +52,6 @@ HSK_VOCABULARY = {
         {"character": "我", "pinyin": "wǒ", "meaning": "I; me"},
         {"character": "你", "pinyin": "nǐ", "meaning": "You"},
         {"character": "好", "pinyin": "hǎo", "meaning": "Good; well"},
-        {"character": "人", "pinyin": "rén", "meaning": "Person"},
-        {"character": "中国", "pinyin": "Zhōng guó", "meaning": "China"},
-        {"character": "朋友", "pinyin": "péng you", "meaning": "Friend"},
         {"character": "学习", "pinyin": "xué xí", "meaning": "To study"},
     ],
     "HSK 2": [
